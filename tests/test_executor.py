@@ -100,6 +100,89 @@ def test_filter_corpus_no_filters_returns_all():
 
 
 # ---------------------------------------------------------------------------
+# recommendation corpus
+# ---------------------------------------------------------------------------
+
+
+def test_build_profile_corpus_uses_interest_profile(config):
+    from omegaconf import open_dict
+
+    with open_dict(config):
+        config.interest.profile = "  Multimodal LLM agents and RAG evaluation.  "
+
+    executor = Executor.__new__(Executor)
+    executor.config = config
+    corpus = executor.build_profile_corpus()
+
+    assert len(corpus) == 1
+    assert corpus[0].title == "User Interest Profile"
+    assert corpus[0].abstract == "Multimodal LLM agents and RAG evaluation."
+    assert corpus[0].paths == ["profile"]
+
+
+def test_build_profile_corpus_rejects_empty_profile(config):
+    from omegaconf import open_dict
+
+    with open_dict(config):
+        config.interest.profile = " "
+
+    executor = Executor.__new__(Executor)
+    executor.config = config
+
+    with pytest.raises(ValueError, match="config.interest.profile must be a non-empty string"):
+        executor.build_profile_corpus()
+
+
+def test_build_recommendation_corpus_default_uses_zotero_flow():
+    corpus = [
+        CorpusPaper(title="Paper A", abstract="A", added_date=datetime(2026, 1, 1), paths=["foo"]),
+        CorpusPaper(title="Paper B", abstract="B", added_date=datetime(2026, 1, 2), paths=["bar"]),
+    ]
+    calls = []
+
+    executor = Executor.__new__(Executor)
+    executor.recommendation_mode = "zotero"
+
+    def fetch_zotero_corpus():
+        calls.append("fetch")
+        return corpus
+
+    def filter_corpus(papers):
+        calls.append("filter")
+        return papers[:1]
+
+    executor.fetch_zotero_corpus = fetch_zotero_corpus
+    executor.filter_corpus = filter_corpus
+
+    assert executor.build_recommendation_corpus() == corpus[:1]
+    assert calls == ["fetch", "filter"]
+
+
+def test_build_recommendation_corpus_profile_skips_zotero(config):
+    from omegaconf import open_dict
+
+    with open_dict(config):
+        config.interest.profile = "Scientific paper recommendation with LLMs."
+
+    executor = Executor.__new__(Executor)
+    executor.config = config
+    executor.recommendation_mode = "profile"
+
+    def fetch_zotero_corpus():
+        raise AssertionError("Zotero should not be called in profile mode")
+
+    def filter_corpus(papers):
+        raise AssertionError("Zotero collection filters should not run in profile mode")
+
+    executor.fetch_zotero_corpus = fetch_zotero_corpus
+    executor.filter_corpus = filter_corpus
+
+    corpus = executor.build_recommendation_corpus()
+    assert len(corpus) == 1
+    assert corpus[0].abstract == "Scientific paper recommendation with LLMs."
+
+
+# ---------------------------------------------------------------------------
 # fetch_zotero_corpus
 # ---------------------------------------------------------------------------
 
@@ -204,6 +287,61 @@ def test_run_end_to_end(config, monkeypatch):
     executor.run()
 
     # Assertions
+    assert len(sent) == 1, "Email should have been sent"
+    _, _, email_body = sent[0]
+    assert "text/html" in email_body
+
+
+def test_run_end_to_end_profile_mode(config, monkeypatch):
+    """Full pipeline with profile mode: profile -> retrieve -> rerank -> TLDR -> email."""
+    import smtplib
+
+    from omegaconf import open_dict
+
+    from tests.canned_responses import (
+        make_sample_paper,
+        make_stub_openai_client,
+        make_stub_smtp,
+    )
+
+    with open_dict(config):
+        config.executor.recommendation_mode = "profile"
+        config.interest.profile = "Retrieval augmented generation and multimodal LLM agents."
+        config.executor.source = ["arxiv"]
+        config.executor.reranker = "api"
+        config.executor.send_empty = False
+
+    def fail_zotero(*args, **kwargs):
+        raise AssertionError("Zotero should not be called in profile mode")
+
+    monkeypatch.setattr("zotero_arxiv_daily.executor.zotero.Zotero", fail_zotero)
+
+    stub_client = make_stub_openai_client()
+    monkeypatch.setattr("zotero_arxiv_daily.executor.OpenAI", lambda **kw: stub_client)
+    monkeypatch.setattr("zotero_arxiv_daily.reranker.api.OpenAI", lambda **kw: stub_client)
+
+    retrieved = [
+        make_sample_paper(title="Profile Paper 1", score=None),
+        make_sample_paper(title="Profile Paper 2", score=None),
+    ]
+
+    import zotero_arxiv_daily.retriever.arxiv_retriever  # noqa: F401
+
+    from zotero_arxiv_daily.retriever.base import registered_retrievers
+
+    monkeypatch.setattr(
+        registered_retrievers["arxiv"],
+        "retrieve_papers",
+        lambda self: retrieved,
+    )
+
+    sent = []
+    monkeypatch.setattr(smtplib, "SMTP", make_stub_smtp(sent))
+    monkeypatch.setattr("zotero_arxiv_daily.retriever.base.sleep", lambda _: None)
+
+    executor = Executor(config)
+    executor.run()
+
     assert len(sent) == 1, "Email should have been sent"
     _, _, email_body = sent[0]
     assert "text/html" in email_body

@@ -29,9 +29,26 @@ def normalize_path_patterns(patterns: list[str] | ListConfig | None, config_key:
     return list(patterns)
 
 
+def normalize_recommendation_mode(mode: str | None) -> str:
+    if mode is None:
+        return "zotero"
+
+    if not isinstance(mode, str):
+        raise TypeError("config.executor.recommendation_mode must be 'zotero' or 'profile'.")
+
+    mode = mode.lower()
+    if mode not in {"zotero", "profile"}:
+        raise ValueError("config.executor.recommendation_mode must be 'zotero' or 'profile'.")
+
+    return mode
+
+
 class Executor:
     def __init__(self, config:DictConfig):
         self.config = config
+        self.recommendation_mode = normalize_recommendation_mode(
+            config.executor.get("recommendation_mode", "zotero")
+        )
         self.include_path_patterns = normalize_path_patterns(config.zotero.include_path, "include_path")
         self.ignore_path_patterns = normalize_path_patterns(config.zotero.ignore_path, "ignore_path")
         self.retrievers = {
@@ -39,6 +56,34 @@ class Executor:
         }
         self.reranker = get_reranker_cls(config.executor.reranker)(config)
         self.openai_client = OpenAI(api_key=config.llm.api.key, base_url=config.llm.api.base_url)
+
+    def build_profile_corpus(self) -> list[CorpusPaper]:
+        interest_config = self.config.get("interest", None)
+        profile = interest_config.get("profile", None) if interest_config is not None else None
+
+        if not isinstance(profile, str) or not profile.strip():
+            raise ValueError(
+                "config.interest.profile must be a non-empty string when "
+                "config.executor.recommendation_mode is 'profile'."
+            )
+
+        return [
+            CorpusPaper(
+                title="User Interest Profile",
+                abstract=profile.strip(),
+                added_date=datetime.now(),
+                paths=["profile"],
+            )
+        ]
+
+    def build_recommendation_corpus(self) -> list[CorpusPaper]:
+        if self.recommendation_mode == "profile":
+            logger.info("Using interest profile as recommendation corpus")
+            return self.build_profile_corpus()
+
+        corpus = self.fetch_zotero_corpus()
+        return self.filter_corpus(corpus)
+
     def fetch_zotero_corpus(self) -> list[CorpusPaper]:
         logger.info("Fetching zotero corpus")
         zot = zotero.Zotero(self.config.zotero.user_id, 'user', self.config.zotero.api_key)
@@ -91,10 +136,12 @@ class Executor:
 
     
     def run(self):
-        corpus = self.fetch_zotero_corpus()
-        corpus = self.filter_corpus(corpus)
+        corpus = self.build_recommendation_corpus()
         if len(corpus) == 0:
-            logger.error(f"No zotero papers found. Please check your zotero settings:\n{self.config.zotero}")
+            if self.recommendation_mode == "profile":
+                logger.error("No interest profile found. Please check config.interest.profile.")
+            else:
+                logger.error(f"No zotero papers found. Please check your zotero settings:\n{self.config.zotero}")
             return
         all_papers = []
         for source, retriever in self.retrievers.items():
